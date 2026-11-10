@@ -1,178 +1,309 @@
 import asyncio
+import json
 import logging
 import os
-import time
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import asyncpg
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import Message
-from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher
+from aiogram.filters import CommandStart
+from aiogram.types import Message, BufferedInputFile
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("telegram-relay")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("relay")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-GROUP_ID = int(os.environ["GROUP_ID"])
-BOT1_ID = int(os.environ["BOT1_ID"])
-API_ID = int(os.environ["TELETHON_API_ID"])
-API_HASH = os.environ["TELETHON_API_HASH"]
-PHONE = os.getenv("TELETHON_PHONE")
-DATABASE_URL = os.environ["DATABASE_URL"]
-TIMEOUT = float(os.getenv("RESPONSE_TIMEOUT_SECONDS", "15"))
-SETTLE = float(os.getenv("RESPONSE_SETTLE_SECONDS", "1"))
+def required(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+BOT_TOKEN = required("BOT_TOKEN")
+OWNER_ID = int(required("OWNER_ID"))
+PRIVATE_GROUP_ID = int(required("PRIVATE_GROUP_ID"))
+BOT1_ID = int(required("BOT1_ID"))
+API_ID = int(required("TELETHON_API_ID"))
+API_HASH = required("TELETHON_API_HASH")
+TELETHON_SESSION = required("TELETHON_SESSION")
+DATABASE_URL = required("DATABASE_URL")
+TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT_SECONDS", "120"))
+SETTLE = float(os.getenv("RESPONSE_SETTLE_SECONDS", "1.0"))
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@").lower()
+
+# Intentionally restricted to non-sensitive, general-purpose commands.
+# Do not add phone/Aadhaar/PAN/address/vehicle-record lookup or SMS dispatch.
+ALLOWED_COMMANDS = {"github", "noobgpt", "song", "image"}
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
-client = TelegramClient("telethon", API_ID, API_HASH)
+user_client = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
 pool: Optional[asyncpg.Pool] = None
 
 @dataclass
 class Job:
     request_id: str
-    chat_id: int
+    public_chat_id: int
+    public_message_id: int
     user_id: int
     command: str
-    future: asyncio.Future
+    command_message_id: Optional[int] = None
+    future: Optional[asyncio.Future] = None
 
-jobs: asyncio.Queue[Job] = asyncio.Queue()
-# Only one request is sent to Bot 1 at a time. This avoids mixing replies
-# when Bot 1 does not reply-to the exact command message.
+queue: asyncio.Queue[Job] = asyncio.Queue()
 active_job: Optional[Job] = None
-active_lock = asyncio.Lock()
-latest_reply: Optional[object] = None
+latest_reply = None
 reply_event = asyncio.Event()
+worker_task: Optional[asyncio.Task] = None
+
+def asyncpg_dsn_and_ssl(url: str):
+    # asyncpg uses the ssl argument; strip libpq-only query parameters.
+    p = urlsplit(url)
+    q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+         if k not in {"sslmode", "channel_binding"}]
+    clean = urlunsplit((p.scheme, p.netloc, p.path, urlencode(q), p.fragment))
+    ssl = "require" if "sslmode=require" in url or p.hostname and (
+        p.hostname.endswith("neon.tech") or "railway" in p.hostname
+    ) else None
+    return clean, ssl
 
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    dsn, ssl = asyncpg_dsn_and_ssl(DATABASE_URL)
+    pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5, ssl=ssl)
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS relay_requests (
                 request_id TEXT PRIMARY KEY,
                 user_id BIGINT NOT NULL,
-                chat_id BIGINT NOT NULL,
+                public_chat_id BIGINT NOT NULL,
+                public_message_id BIGINT NOT NULL,
                 command TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 completed_at TIMESTAMPTZ,
-                result_message_id BIGINT,
+                source_message_id BIGINT,
                 error TEXT
             )
         """)
 
-@dp.message(Command("start"))
-async def start(message: Message):
-    await message.answer("Send the command you want forwarded to the connected bot.\nExample: /getdata 123")
+async def set_status(request_id: str, status: str, error: Optional[str] = None,
+                     source_message_id: Optional[int] = None):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE relay_requests
+            SET status=$2, error=$3, source_message_id=$4,
+                completed_at=CASE WHEN $2 IN ('completed','timeout','error') THEN NOW() ELSE completed_at END
+            WHERE request_id=$1
+        """, request_id, status, error, source_message_id)
 
-@dp.message(F.text)
-async def receive_command(message: Message):
-    if message.chat.type != "private":
+def extract_command(text: str):
+    match = re.match(r"^\s*/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?$", text or "", re.S)
+    if not match:
+        return None, None
+    return match.group(1).lower(), (match.group(2) or "").strip()
+
+def safe_json_summary(raw: str) -> Optional[str]:
+    """Return only non-identifying status metadata from JSON, never raw records."""
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return "The upstream bot returned structured data. Raw JSON is not relayed."
+    status = obj.get("api_status", obj.get("status", "completed"))
+    count = obj.get("record_count")
+    elapsed = obj.get("response_time")
+    lines = ["✅ Request completed", f"Status: {str(status)[:60]}"]
+    if isinstance(count, (int, float)):
+        lines.append(f"Record count: {int(count)}")
+    if isinstance(elapsed, (str, int, float)):
+        lines.append(f"Response time: {str(elapsed)[:30]}")
+    lines.append("Sensitive record fields are not forwarded.")
+    return "\n".join(lines)
+
+async def send_result(job: Job, message):
+    text = (message.message or "").strip()
+    # JSON responses are summarized; raw personal records are never broadcast.
+    summary = safe_json_summary(text) if text.startswith("{") else None
+    output = summary if summary is not None else text
+    if output:
+        await bot.send_message(
+            job.public_chat_id,
+            output[:4000],
+            reply_to_message_id=job.public_message_id,
+            disable_web_page_preview=True,
+        )
+    elif message.media:
+        # Media forwarding is deliberately disabled in this safe starter.
+        await bot.send_message(
+            job.public_chat_id,
+            "Bot 1 returned an attachment. Attachments are not automatically redistributed.",
+            reply_to_message_id=job.public_message_id,
+        )
+    else:
+        await bot.send_message(
+            job.public_chat_id,
+            "Bot 1 returned an unsupported response.",
+            reply_to_message_id=job.public_message_id,
+        )
+    await set_status(job.request_id, "completed", source_message_id=message.id)
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    await message.answer(
+        "Relay is online. Use an enabled command in this group.\n"
+        "Available: /github, /noobgpt, /song, /image, /help"
+    )
+
+@dp.message()
+async def handle_messages(message: Message):
+    if not message.text:
         return
-    command = (message.text or "").strip()
+
+    command, args = extract_command(message.text)
     if not command:
         return
-    request_id = uuid.uuid4().hex
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    job = Job(request_id, message.chat.id, message.from_user.id, command, future)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO relay_requests(request_id,user_id,chat_id,command,status) VALUES($1,$2,$3,$4,'queued')",
-            request_id, message.from_user.id, message.chat.id, command
-        )
-    await jobs.put(job)
-    await message.answer("⏳ Request received. Waiting for the result…")
 
-async def worker():
+    # Owner login is deliberately handled as secure out-of-band session setup.
+    if command == "login":
+        if message.chat.type != "private" or not message.from_user or message.from_user.id != OWNER_ID:
+            return
+        await message.answer(
+            "For account security, do not send Telegram OTPs or 2FA passwords to this bot. "
+            "Generate a Telethon StringSession locally with generate_session.py, then set "
+            "TELETHON_SESSION in Railway Variables and redeploy."
+        )
+        return
+
+    if command == "help":
+        await message.reply(
+            "⚡ Enabled commands:\n"
+            "• /github <username> — public GitHub profile\n"
+            "• /noobgpt <prompt> — AI assistant\n"
+            "• /song <prompt> — song generation\n"
+            "• /image <prompt> — image generation\n"
+            "• /help — this message\n\n"
+            "Commands that retrieve private personal records or dispatch unsolicited SMS are not enabled."
+        )
+        return
+
+    if command not in ALLOWED_COMMANDS:
+        return
+    if not args:
+        await message.reply(f"Usage: /{command} <input>")
+        return
+    if not message.from_user:
+        return
+
+    # Accept commands in groups/supergroups; private-chat use is also supported.
+    command_text = f"/{command} {args}"
+    request_id = uuid.uuid4().hex
+    job = Job(
+        request_id=request_id,
+        public_chat_id=message.chat.id,
+        public_message_id=message.message_id,
+        user_id=message.from_user.id,
+        command=command_text,
+    )
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO relay_requests
+            (request_id,user_id,public_chat_id,public_message_id,command,status)
+            VALUES($1,$2,$3,$4,$5,'queued')
+        """, request_id, job.user_id, job.public_chat_id, job.public_message_id, job.command)
+    await queue.put(job)
+    await message.reply("⏳ Request queued. Waiting for the connected service…")
+
+async def relay_worker():
     global active_job, latest_reply
     while True:
-        job = await jobs.get()
+        job = await queue.get()
         try:
-            async with active_lock:
-                active_job = job
-                latest_reply = None
-                reply_event.clear()
-                async with pool.acquire() as conn:
-                    await conn.execute("UPDATE relay_requests SET status='sent' WHERE request_id=$1", job.request_id)
-                # Bot 2 posts the command into the group. The Telethon account
-                # must be a member of that group and able to see Bot 1's replies.
-                await bot.send_message(GROUP_ID, job.command)
-                try:
-                    await asyncio.wait_for(reply_event.wait(), timeout=TIMEOUT)
-                    # Allow a short burst of edits/follow-up messages to settle.
-                    await asyncio.sleep(SETTLE)
-                    result = latest_reply
-                    if result is None:
-                        raise asyncio.TimeoutError
-                    await deliver(job, result)
-                except asyncio.TimeoutError:
-                    await bot.send_message(job.chat_id, "⌛ Bot 1 did not reply within 15 seconds. Please try again.")
-                    async with pool.acquire() as conn:
-                        await conn.execute("UPDATE relay_requests SET status='timeout', error='Bot 1 response timeout' WHERE request_id=$1", job.request_id)
-        except Exception:
-            log.exception("Request %s failed", job.request_id)
+            active_job = job
+            latest_reply = None
+            reply_event.clear()
+            await set_status(job.request_id, "sent")
+            # The logged-in user account sends the command into the private group.
+            sent = await user_client.send_message(PRIVATE_GROUP_ID, job.command)
+            job.command_message_id = sent.id
+
             try:
-                await bot.send_message(job.chat_id, "⚠️ Something went wrong while processing your request.")
+                await asyncio.wait_for(reply_event.wait(), timeout=TIMEOUT)
+                await asyncio.sleep(SETTLE)
+                result = latest_reply
+                if result is None:
+                    raise asyncio.TimeoutError
+                await send_result(job, result)
+            except asyncio.TimeoutError:
+                await bot.send_message(
+                    job.public_chat_id,
+                    f"⌛ No response received within {TIMEOUT} seconds.",
+                    reply_to_message_id=job.public_message_id,
+                )
+                await set_status(job.request_id, "timeout", "Upstream response timeout")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Relay request failed: %s", job.request_id)
+            try:
+                await bot.send_message(
+                    job.public_chat_id,
+                    "⚠️ The relay could not process this request. Please contact the bot owner.",
+                    reply_to_message_id=job.public_message_id,
+                )
             except Exception:
-                pass
-            async with pool.acquire() as conn:
-                await conn.execute("UPDATE relay_requests SET status='error', error='Internal processing error' WHERE request_id=$1", job.request_id)
+                log.exception("Could not send failure notice")
+            await set_status(job.request_id, "error", "Internal relay error")
         finally:
             active_job = None
-            jobs.task_done()
-
-async def deliver(job: Job, event_message):
-    # Forward the latest Bot 1 message as-is when possible, preserving media.
-    # For text-only replies, copy_message is not available across user sessions;
-    # send text directly. Media is downloaded by Telethon and uploaded by Bot 2.
-    if event_message.message:
-        await bot.send_message(job.chat_id, event_message.message)
-    elif event_message.media:
-        data = await event_message.download_media(file=bytes)
-        if data:
-            from aiogram.types import BufferedInputFile
-            filename = "result.bin"
-            if event_message.photo:
-                filename = "result.jpg"
-            elif event_message.document:
-                filename = event_message.file.name or "result.bin"
-            await bot.send_document(job.chat_id, BufferedInputFile(data, filename=filename))
-        else:
-            await bot.send_message(job.chat_id, "Bot 1 replied with media, but it could not be downloaded.")
-    else:
-        await bot.send_message(job.chat_id, "Bot 1 sent a reply that this relay cannot display.")
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE relay_requests SET status='completed', completed_at=NOW(), result_message_id=$2 WHERE request_id=$1",
-            job.request_id, event_message.id
-        )
+            latest_reply = None
+            queue.task_done()
 
 async def main():
+    global worker_task
     await init_db()
-    await client.start(phone=PHONE)
-    log.info("Telethon listener connected")
+    await user_client.connect()
+    if not await user_client.is_user_authorized():
+        raise RuntimeError(
+            "Telethon session is not authorized. Generate a StringSession locally "
+            "and set TELETHON_SESSION in Railway."
+        )
 
-    @client.on(events.NewMessage(chats=GROUP_ID, from_users=BOT1_ID, incoming=True))
+    @user_client.on(events.NewMessage(chats=PRIVATE_GROUP_ID, from_users=BOT1_ID, incoming=True))
     async def on_bot1_reply(event):
         global latest_reply
-        if active_job is None:
-            log.info("Ignoring Bot 1 message: no active request")
+        job = active_job
+        if job is None:
             return
+        # Prefer Telegram reply-to correlation where Bot 1 uses it.
+        reply_to = event.message.reply_to_msg_id
+        if reply_to is not None and job.command_message_id is not None:
+            if reply_to != job.command_message_id:
+                return
         latest_reply = event.message
         reply_event.set()
 
-    worker_task = asyncio.create_task(worker())
+    log.info("Telethon listener authorized; starting Bot 2 polling")
+    worker_task = asyncio.create_task(relay_worker())
     try:
         await dp.start_polling(bot)
     finally:
-        worker_task.cancel()
-        await client.disconnect()
+        if worker_task:
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+        await user_client.disconnect()
         await bot.session.close()
         if pool:
             await pool.close()

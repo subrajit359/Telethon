@@ -1,39 +1,63 @@
-# Telegram Bot Relay (Bot 2 → group → Bot 1 → Bot 2)
+# Telegram Relay for Railway (restricted safe-command starter)
 
-Python starter using Aiogram, Telethon and PostgreSQL. It queues user requests and sends them **one at a time** to the group so Bot 1 replies cannot be mixed between concurrent users. It forwards the latest message received from the configured Bot 1 within the 15-second response window.
+This service accepts a small allowlist of general-purpose commands in public groups,
+queues them, sends them to a private Telegram group using an authorized Telethon
+user account, listens for replies from Bot 1, and posts the response back in the
+original public group. PostgreSQL stores request status.
 
-## Important Telegram constraints
+## Safety scope
+Enabled commands: `/github`, `/noobgpt`, `/song`, `/image`, `/help`.
+It intentionally does not relay commands for private personal records (phone,
+Aadhaar, PAN, addresses, vehicle records, etc.) or SMS dispatch. If Bot 1 returns
+JSON, only non-identifying status metadata is posted; raw JSON/data records are
+not redistributed. Attachments are not automatically redistributed.
 
-- Bot 2 can send a message to the group if it is a member and has permission.
-- The Bot API bot generally cannot read another bot's messages. A dedicated Telegram user account logged in through Telethon listens for Bot 1's replies.
-- The Telethon account must be a member of the group and must be allowed to see Bot 1's messages.
-- This starter assumes Bot 1's response is a new message from the configured `BOT1_ID`. If Bot 1 edits an existing message instead of sending a new one, or responds in a thread/topic, the listener needs adjustment.
-- Only one command is in flight at a time. This is deliberate: if Bot 1 does not reply-to the command message, there is no reliable way to correlate concurrent requests from group traffic alone.
-- Use this only with accounts, bots, group content and data you are authorized to access. Protect the Telethon session file like a password.
+## Railway variables
+Set all values in `.env.example` as Railway service variables. `DATABASE_URL`
+must point to an accessible PostgreSQL database. For Neon, use the connection
+string from Neon; the app requests TLS for Neon hosts.
 
-## Setup
+- `BOT_TOKEN`: Bot 2 token
+- `OWNER_ID`: numeric Telegram ID authorized for owner-only `/login` instructions
+- `PRIVATE_GROUP_ID`: numeric private group chat ID (usually starts with `-100`)
+- `BOT1_ID`: numeric user ID of Bot 1
+- `TELETHON_API_ID`, `TELETHON_API_HASH`: from my.telegram.org
+- `TELETHON_SESSION`: StringSession generated locally
+- `DATABASE_URL`: PostgreSQL DSN
+- `RESPONSE_TIMEOUT_SECONDS`: default 120
+- `RESPONSE_SETTLE_SECONDS`: default 1.0
 
-1. Create Bot 2 with @BotFather and add it to the private group. Give it permission to send messages.
-2. Add a dedicated Telegram user account to the group. This account will be used by Telethon to read Bot 1's replies.
-3. Get `api_id` and `api_hash` from https://my.telegram.org.
-4. Find the numeric group ID and Bot 1's numeric user ID.
-5. Copy `.env.example` to `.env` and fill in every value. Change the PostgreSQL password in both `.env` and `docker-compose.yml`.
-6. Start it:
+## Generate the Telethon session
+On a trusted computer or Android Termux:
+1. `pip install -r requirements.txt`
+2. `python generate_session.py`
+3. Enter API ID, API hash, phone, OTP, and 2FA password if prompted.
+4. Copy the resulting session string into Railway as `TELETHON_SESSION`.
+5. Never commit or share the session string.
 
-   ```bash
-   docker compose up --build -d
-   ```
+The bot deliberately does not collect Telegram OTPs in chat. `/login` in the
+owner's private chat explains this secure setup.
 
-7. On first Telethon login, inspect logs and complete the interactive login/code/2FA prompt. For production, create the Telethon session once interactively and then run the service with the saved session file mounted persistently. Do not share the `.session` file.
+## Deploy
+1. Push this folder to a private GitHub repository.
+2. Create a Railway project from that repository.
+3. Add the environment variables.
+4. Deploy. The Dockerfile starts `python main.py`.
+5. Add Bot 2 to each public group with permission to send messages.
+6. Add the Telethon account to the private group. Ensure it can send commands
+   and read Bot 1's replies.
+7. Disable Bot 2's group privacy in BotFather if you need it to see ordinary
+   group messages. Explicit slash commands are generally visible to bots, but
+   group permissions and command addressing still matter.
 
-## First-run Telethon login note
+## Reply matching limitation
+Only one request is sent to Bot 1 at a time. This prevents ordinary overlapping
+requests. If Bot 1 replies to the exact command message, the app verifies the
+reply-to message ID. If Bot 1 does not use reply-to, the app associates the next
+new message from Bot 1 with the active request. A delayed response from an older
+request could therefore be misattributed; strict correlation requires Bot 1 to
+reply to the command message or include a request identifier.
 
-The default container command is non-interactive. The cleanest deployment is to create the Telethon session on a trusted machine first using the same API ID/hash and session name `telethon`, then securely copy `telethon.session` into this project directory before starting Compose. Never commit `.env` or `telethon.session` to Git.
-
-## Current behavior / limitations
-
-- Text replies are delivered as text; media is delivered as a document attachment.
-- The listener captures the first new message from Bot 1 during the active request, then waits the settle interval and uses the latest captured message.
-- If Bot 1 emits several messages, the final one within the settle period is delivered. Increase `RESPONSE_SETTLE_SECONDS` if Bot 1 sends a burst.
-- A 15-second timeout is configurable with `RESPONSE_TIMEOUT_SECONDS`.
-- Database rows record request status and errors. Add authentication, rate limits, admin controls and privacy/retention rules before opening the bot publicly.
+## Important
+This is a deployment-ready starter, not a guarantee against platform, permission,
+credential, or Bot 1 behavior differences. Test first with one harmless command.
